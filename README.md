@@ -17,7 +17,7 @@ Every hyper-parameter is a `const` in the `CONFIG` block at the top of
 the data path(s). Resume is automatic and unconditional.
 
 ```
-cargo build --release --features cuda
+cargo build --release
 ./target/release/erebus-trainer data/          # or: a.binpack b.binpack ...
 ```
 
@@ -88,18 +88,15 @@ net together.
 
 ## Build
 
-Real training needs a GPU backend (this bullet version has **no CPU backend** —
-without a feature it compiles against a mock device and will not train).
+The `cuda` feature is **on by default** — this bullet version has no CPU
+backend, and the trainer only runs on NVIDIA hardware. The build needs the CUDA
+toolkit (`CUDA_PATH` set), which Colab/Kaggle GPU images already have.
 
 ```bash
-# CUDA (Colab, Kaggle, local NVIDIA). Needs the CUDA toolkit / nvcc on PATH.
-cargo build --release --features cuda
+cargo build --release                        # CUDA build
 
-# ROCm
-cargo build --release --features rocm
-
-# no feature: type-checks only, cannot train
-cargo check
+cargo build --release --no-default-features --features rocm   # ROCm instead
+cargo check  --no-default-features           # syntax-only, no toolkit needed
 ```
 
 Toolchain: rustc >= 1.87, edition 2024. `rustup update stable` on a fresh
@@ -110,7 +107,7 @@ Colab/Kaggle image.
 ## Run
 
 ```bash
-cargo build --release --features cuda
+cargo build --release
 cp target/release/erebus-trainer  ~/bin/          # reuse the binary anywhere
 
 ./erebus-trainer data/                            # a dir of *.binpack (sorted)
@@ -138,7 +135,7 @@ That's the whole interface. Everything else is the `CONFIG` block in
 | `SHUFFLE_BUFFER_MB` | `4096` | bigger = better local mixing |
 | `ROTATE_DATA_EACH_SESSION` | `true` | see Resume |
 
-Edit, `cargo build --release --features cuda`, copy the binary, done.
+Edit, `cargo build --release`, copy the binary, done.
 
 ---
 
