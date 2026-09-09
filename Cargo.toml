@@ -1,0 +1,25 @@
+[package]
+name = "erebus-trainer"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+
+[[bin]]
+name = "erebus-trainer"
+path = "src/main.rs"
+
+[dependencies]
+# bullet_lib on crates.io is ancient/yanked; track the repo. Pinned to a
+# known-good rev -- bump deliberately, re-test the engine round-trip after.
+bullet_lib = { git = "https://github.com/jw1912/bullet", rev = "629ee50000b2afb7b3337595401c830d3b1e0f42" }
+
+[features]
+# Real training requires a GPU backend. Without one, bullet_lib compiles
+# against a mock device and will not train. Build/run with:
+#   cargo run --release --features cuda -- <args>
+cuda = ["bullet_lib/cuda"]
+rocm = ["bullet_lib/rocm"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
