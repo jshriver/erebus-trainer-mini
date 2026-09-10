@@ -122,7 +122,10 @@ That's the whole interface. Everything else is the `CONFIG` block in
 | `HIDDEN_SIZE` | `1024` | must equal `HL` in the engine |
 | `NET_ID` | `"erebus"` | checkpoint prefix → `checkpoints/erebus-<N>/`; change it if you train a second width |
 | `OUT_DIR` | `"checkpoints"` | put on persistent storage on Colab/Kaggle |
-| `END_SUPERBATCH` | `400` | ~40B positions seen (~0.18 epochs of 218B) |
+| `EPOCHS` | `1.0` | run length is derived: `EPOCHS * total_positions * FILTER_KEEP_FRAC / (BATCHES_PER_SUPERBATCH * BATCH_SIZE)` superbatches. Per-file `total_positions`: a `<file>.binpack.count` sidecar (plain integer) if present, else the `POSITION_COUNTS` table (keyed by basename) in `src/main.rs`. Env `EREBUS_END_SUPERBATCH=N` overrides the whole calc. |
+| `POSITION_COUNTS` | `[]` | compiled-in `(basename, count)` table; source of `total_positions` when there's no sidecar |
+| `FILTER_KEEP_FRAC` | `1.0` | est. fraction of raw positions surviving `filter()`; lower to ~0.6 if the loader wraps before finishing |
+| `MAX_SUPERBATCH` | `2000` | safety cap on the derived length |
 | `BATCH_SIZE` | `16384` | |
 | `BATCHES_PER_SUPERBATCH` | `6104` | ~100M positions/superbatch |
 | `SAVE_RATE` | `10` | checkpoint every N superbatches |
@@ -151,7 +154,7 @@ naive restart re-trains on the same early files. This trainer handles it:
 2. With `ROTATE_DATA_EACH_SESSION = true` it **rotates the data file list left
    by `(start_superbatch - 1) % n_files`** so each resumed session begins on a
    different binpack, spreading coverage.
-3. If `N + 1 > END_SUPERBATCH` it prints "already trained" and exits.
+3. If `N + 1 >` the derived end superbatch it prints "already trained" and exits.
 
 So the workflow is just: **re-run the identical command** after a preemption.
 
