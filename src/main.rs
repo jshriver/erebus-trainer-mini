@@ -65,7 +65,7 @@ const OUT_DIR: &str = "checkpoints";
 /// order (run-all.sh), or all at once if they fit on disk; after TOTAL_PASSES
 /// laps the net is done at GLOBAL_END. `EREBUS_END_SUPERBATCH=N` forces a
 /// specific session end. Interrupted sessions resume exactly (see .session file).
-const TOTAL_PASSES: f64 = 2.0;
+const TOTAL_PASSES: f64 = 1.0;
 /// Fraction of each passed file to consume per session. 1.0 = one full pass.
 const PASS_FRACTION_PER_FILE: f64 = 1.0;
 

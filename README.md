@@ -116,16 +116,21 @@ then stops. Sessions advance along the one schedule — no per-file LR restarts.
 cargo build --release
 cp target/release/erebus-trainer  ~/bin/
 
-# best: all files at once if they fit on disk (per-superbatch mixing of all sources)
-./erebus-trainer data/            # run repeatedly; each run = one pass, until the plan is done
+# A) all files on disk at once -- best mixing, one pass then it stops
+./erebus-trainer data/                       # re-run after any preemption
 
-# fallback: one file per session, shuffled order, driven by the helper script
-./run-all.sh data/                # resumable; stops itself when TOTAL_PASSES laps are done
+# B) all files on disk, one per session in a reshuffled order
+./run-all.sh data/                           # resumable; self-stops at the plan end
+
+# C) only room for one binpack at a time -- download, train, delete, next
+DL_CMD='curl -fL --retry 5 -o "$NAME" "https://HOST/PATH/$NAME"' \
+  ./train-staged.sh /mnt/scratch/binpacks    # walks train-order.txt; resumable
 ```
 
-`run-all.sh` shuffles the file list per pass (persisted, so re-runs keep order),
-runs the trainer once per file, skips finished files, and stops when the trainer
-signals the plan is complete (exit code 3). Re-run it after any preemption.
+`train-order.txt` is the 41 basenames in a fixed shuffled order (regenerate with
+`shuf` if you like — just keep it fixed for the whole run). `train-staged.sh`
+fetches each via your `$DL_CMD`, trains one session, deletes the binpack, and
+records a marker so a re-run continues where it stopped.
 
 Exit codes: `0` a session trained, `3` nothing to do (plan complete), `1` error.
 
@@ -136,7 +141,7 @@ Everything else is the `CONFIG` block in `src/main.rs`:
 | `HIDDEN_SIZE` | `1024` | must equal `HL` in the engine |
 | `NET_ID` | `"erebus"` | checkpoint prefix → `checkpoints/erebus-<N>/`; change it if you train a second width |
 | `OUT_DIR` | `"checkpoints"` | put on persistent storage on Colab/Kaggle |
-| `TOTAL_PASSES` | `2.0` | epochs over the whole corpus → `GLOBAL_END = round(TOTAL_PASSES * Σ POSITION_COUNTS * FILTER_KEEP_FRAC / (BATCHES_PER_SUPERBATCH * BATCH_SIZE))`. Raise & rebuild to train longer. |
+| `TOTAL_PASSES` | `1.0` | epochs over the whole corpus → `GLOBAL_END = round(TOTAL_PASSES * Σ POSITION_COUNTS * FILTER_KEEP_FRAC / (BATCHES_PER_SUPERBATCH * BATCH_SIZE))` = 2188 at `1.0`. Raise & rebuild to train longer. |
 | `PASS_FRACTION_PER_FILE` | `1.0` | how much of each passed file one session consumes (`session_end = min(resume + round(PASS_FRACTION_PER_FILE * passed_positions * FILTER_KEEP_FRAC / pos_per_sb), GLOBAL_END)`) |
 | `POSITION_COUNTS` | 41 rows | compiled-in `(basename, raw_count)` table; per-file `passed_positions` source (a `<file>.binpack.count` sidecar, plain integer, overrides it) |
 | `FILTER_KEEP_FRAC` | `1.0` | est. fraction of raw positions surviving `filter()`; lower to ~0.6 if the loader wraps before a session ends |
@@ -203,11 +208,13 @@ they stay on schedule across any number of resumes and session splits.
   manually if you want an offline sanity eval later.
 - Files are consumed in list order with a `SHUFFLE_BUFFER_MB`-sized shuffle
   window, then the list repeats. **Passing all files at once** (`erebus-trainer
-  data/`) mixes every source within each superbatch — strongly preferred if the
-  ~570 GB fits. **One file per session** (`run-all.sh`) is sequential per
-  session; `run-all.sh` reshuffles file order every pass and `TOTAL_PASSES = 2`
-  to blunt the resulting catastrophic-forgetting. For the strongest single-pass
-  run, pre-interleave all 41 with `bullet-utils interleave` and train on that.
+  data/`) mixes every source within each superbatch — strongly preferred if disk
+  allows. **One file per session** is sequential across the run, so **the order
+  you feed files matters**: download/feed the 41 in a randomised order (fix it
+  once and keep it), not month-by-month, or a net that plateaus early will only
+  have seen the first few sources. `run-all.sh` does this shuffling for you when
+  the files are all present; with on-demand staging, shuffle your download list.
+  For the strongest run, pre-interleave all 41 with `bullet-utils interleave`.
 
 ---
 
