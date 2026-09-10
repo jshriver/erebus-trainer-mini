@@ -43,18 +43,31 @@ const NET_ID: &str = "erebus";
 /// (Google Drive, a Kaggle Dataset output) when on a preemptible VM.
 const OUT_DIR: &str = "checkpoints";
 
-/// Training length. Instead of a fixed superbatch count, the run length is
-/// derived at startup from the input size so it's ~EPOCHS passes over the data:
+/// Training is ONE global schedule over the whole corpus (every file in
+/// `POSITION_COUNTS`); individual runs advance along it. The cosine LR and
+/// linear WDL both run over `1..=GLOBAL_END`, so they progress smoothly no
+/// matter how the run is split into sessions -- no per-file LR restarts.
 ///
-///   end_superbatch = round(EPOCHS * total_positions * FILTER_KEEP_FRAC
-///                          / (BATCHES_PER_SUPERBATCH * BATCH_SIZE))
+///   GLOBAL_END = round(TOTAL_PASSES * corpus_positions * FILTER_KEEP_FRAC
+///                      / (BATCHES_PER_SUPERBATCH * BATCH_SIZE))
 ///
-/// `total_positions` is looked up per input file. Precedence, per file:
-///   1. `<file>.binpack.count` sidecar (plain integer; `_` / `,` / ws ignored)
-///   2. the `POSITION_COUNTS` table below, keyed by file *basename*
-/// A file matching neither is fatal. Env `EREBUS_END_SUPERBATCH=N` bypasses the
-/// whole calc.
-const EPOCHS: f64 = 1.0;
+/// Each invocation resumes from the last checkpoint and trains ONE pass over the
+/// file(s) you pass it, then stops:
+///
+///   session_end = min(resume_point
+///                     + round(PASS_FRACTION_PER_FILE * passed_positions
+///                             * FILTER_KEEP_FRAC / pos_per_superbatch),
+///                     GLOBAL_END)
+///
+/// `passed_positions` is looked up per file: a `<file>.binpack.count` sidecar
+/// (plain integer; `_` / `,` / ws ignored) if present, else the `POSITION_COUNTS`
+/// table keyed by basename. Workflow: feed the files one per session in shuffled
+/// order (run-all.sh), or all at once if they fit on disk; after TOTAL_PASSES
+/// laps the net is done at GLOBAL_END. `EREBUS_END_SUPERBATCH=N` forces a
+/// specific session end. Interrupted sessions resume exactly (see .session file).
+const TOTAL_PASSES: f64 = 2.0;
+/// Fraction of each passed file to consume per session. 1.0 = one full pass.
+const PASS_FRACTION_PER_FILE: f64 = 1.0;
 
 /// Known raw position counts, keyed by binpack basename (no directory), from
 /// `binpack_counter`. Order doesn't matter. Sum = 218_849_949_380 over 41 files.
@@ -105,9 +118,10 @@ const POSITION_COUNTS: &[(&str, u64)] = &[
 /// count as the training-position budget (the loader may wrap slightly at the
 /// end); lower it (~0.6) if bullet logs that it looped the data before finishing.
 const FILTER_KEEP_FRAC: f64 = 1.0;
-/// Safety cap on the derived length -- a bad count can't launch a runaway run.
-/// One epoch of all 41 binpacks (~219B pos) is ~2188 superbatches, so this
-/// allows roughly 2 epochs of the full set before clamping (and warning).
+/// Safety cap on a single session's superbatch budget -- a bad count can't
+/// launch a runaway session. The largest single binpack is ~139 superbatches,
+/// so this only trips on a corrupt/huge count. GLOBAL_END is not clamped (it's
+/// derived from the trusted compiled table).
 const MAX_SUPERBATCH: usize = 5000;
 /// Positions per batch.
 const BATCH_SIZE: usize = 16_384;
@@ -116,11 +130,12 @@ const BATCHES_PER_SUPERBATCH: usize = 6104;
 /// Save a checkpoint every this many superbatches (also always saves the last).
 const SAVE_RATE: usize = 10;
 
-/// Learning rate: cosine decay from LR_START to LR_FINAL over the whole run.
+/// Learning rate: cosine decay from LR_START to LR_FINAL over `1..=GLOBAL_END`
+/// (the whole TOTAL_PASSES plan, not the individual session).
 const LR_START: f32 = 0.001;
 const LR_FINAL: f32 = 2.5e-6;
 
-/// WDL lambda: linear taper from WDL_START (superbatch 1) to WDL_END (last).
+/// WDL lambda: linear taper from WDL_START to WDL_END over `1..=GLOBAL_END`.
 /// target = lambda * game_result + (1 - lambda) * sigmoid(score / EVAL_SCALE)
 const WDL_START: f32 = 0.2;
 const WDL_END: f32 = 0.6;
@@ -149,6 +164,13 @@ const ROTATE_DATA_EACH_SESSION: bool = true;
 fn die(msg: impl AsRef<str>) -> ! {
     eprintln!("erebus-trainer: {}", msg.as_ref());
     std::process::exit(1);
+}
+
+/// Clean "no work to do" exit (plan already complete, etc.). Exit code 3 so a
+/// driver script can tell it apart from an error (1) or a training run (0).
+fn nothing_to_do(msg: impl AsRef<str>) -> ! {
+    println!("{}", msg.as_ref());
+    std::process::exit(3);
 }
 
 fn usage() -> ! {
@@ -227,6 +249,54 @@ fn count_positions(files: &[String]) -> u64 {
     total
 }
 
+/// Total positions across every file in the compiled `POSITION_COUNTS` table.
+fn corpus_positions() -> u64 {
+    POSITION_COUNTS.iter().map(|(_, n)| *n).sum()
+}
+
+/// `<OUT_DIR>/<NET_ID>.session` records `<began_at> <stop_at>` for the current
+/// session so a preempted + resumed run finishes the same window instead of
+/// opening a fresh one from the (later) resume point.
+fn session_path() -> String {
+    format!("{OUT_DIR}/{NET_ID}.session")
+}
+
+fn read_session() -> Option<(usize, usize)> {
+    let s = std::fs::read_to_string(session_path()).ok()?;
+    let mut it = s.split_whitespace();
+    Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+}
+
+fn write_session(began: usize, stop: usize) {
+    let _ = std::fs::create_dir_all(OUT_DIR);
+    let p = session_path();
+    if let Err(e) = std::fs::write(&p, format!("{began} {stop}\n")) {
+        eprintln!("erebus-trainer: warning: could not write {p}: {e}");
+    }
+}
+
+/// `LinearWDL` tapers over the `end_superbatch` bullet passes it (the per-session
+/// end). This variant tapers over an absolute `1..=final_superbatch` window so
+/// the WDL schedule stays global across sessions, matching the LR cosine.
+#[derive(Clone, Debug)]
+struct GlobalLinearWDL {
+    start: f32,
+    end: f32,
+    final_superbatch: usize,
+}
+
+impl wdl::WdlScheduler for GlobalLinearWDL {
+    fn blend(&self, _batch: usize, superbatch: usize, _max: usize) -> f32 {
+        let denom = self.final_superbatch.saturating_sub(1).max(1) as f32;
+        let t = (superbatch.saturating_sub(1) as f32 / denom).clamp(0.0, 1.0);
+        self.start + t * (self.end - self.start)
+    }
+
+    fn colourful(&self) -> String {
+        format!("linear taper {} -> {} over 1..={} (global)", self.start, self.end, self.final_superbatch)
+    }
+}
+
 /// Highest N such that `<OUT_DIR>/<NET_ID>-<N>/optimiser_state/` exists.
 fn latest_checkpoint() -> Option<(String, usize)> {
     let prefix = format!("{NET_ID}-");
@@ -288,46 +358,62 @@ fn main() {
     }
     let paths_ref: Vec<&str> = files.iter().map(String::as_str).collect();
 
-    // ---- training length: env override, else derive ~EPOCHS passes from data size ----
+    // ---- global plan + this session's stop point ----
     let pos_per_superbatch = BATCHES_PER_SUPERBATCH * BATCH_SIZE;
-    let end_superbatch: usize = match std::env::var("EREBUS_END_SUPERBATCH") {
-        Ok(v) => {
-            let n = v
-                .trim()
-                .parse::<usize>()
-                .unwrap_or_else(|e| die(format!("EREBUS_END_SUPERBATCH not a number: {e}")));
-            println!("END_SUPERBATCH = {n} (from EREBUS_END_SUPERBATCH)");
-            n.max(1)
+    let global_end: usize = ((TOTAL_PASSES * corpus_positions() as f64 * FILTER_KEEP_FRAC
+        / pos_per_superbatch as f64)
+        .round() as usize)
+        .max(1);
+
+    let end_superbatch: usize = if let Ok(v) = std::env::var("EREBUS_END_SUPERBATCH") {
+        let n = v
+            .trim()
+            .parse::<usize>()
+            .unwrap_or_else(|e| die(format!("EREBUS_END_SUPERBATCH not a number: {e}")));
+        if start_superbatch > n {
+            nothing_to_do(format!(
+                "'{NET_ID}': EREBUS_END_SUPERBATCH={n} but already at superbatch {start_superbatch}."
+            ));
         }
-        Err(_) => {
-            let total = count_positions(&files);
-            let want = (EPOCHS * total as f64 * FILTER_KEEP_FRAC / pos_per_superbatch as f64).round()
-                as usize;
-            let n = want.clamp(1, MAX_SUPERBATCH);
-            println!(
-                "data positions: {total} (sidecar / POSITION_COUNTS)  ->  END_SUPERBATCH = {n}  \
-                 (EPOCHS={EPOCHS}, filter_keep={FILTER_KEEP_FRAC}, {pos_per_superbatch} pos/superbatch)"
-            );
-            if n != want {
-                println!("  (clamped from {want} by MAX_SUPERBATCH={MAX_SUPERBATCH})");
-            }
-            n
-        }
-    };
-    if start_superbatch > end_superbatch {
+        write_session(start_superbatch, n);
+        println!("session {start_superbatch}..={n}  (EREBUS_END_SUPERBATCH override; global end {global_end})");
+        n
+    } else if start_superbatch > global_end {
+        nothing_to_do(format!(
+            "'{NET_ID}' has completed its {TOTAL_PASSES}-pass plan ({global_end} superbatches). \
+             Nothing to do -- raise TOTAL_PASSES and rebuild to train longer."
+        ));
+    } else if let Some((began, stop)) =
+        read_session().filter(|&(b, s)| start_superbatch >= b && start_superbatch <= s)
+    {
+        // resuming a session interrupted mid-window (e.g. Colab preemption)
+        let stop = stop.min(global_end);
+        println!("session {began}..={stop} resumed at superbatch {start_superbatch}  (global end {global_end})");
+        stop
+    } else {
+        // new session: one pass over the file(s) passed now
+        let passed = count_positions(&files);
+        let budget = ((PASS_FRACTION_PER_FILE * passed as f64 * FILTER_KEEP_FRAC
+            / pos_per_superbatch as f64)
+            .round() as usize)
+            .clamp(1, MAX_SUPERBATCH);
+        let stop = (start_superbatch - 1 + budget).min(global_end);
+        write_session(start_superbatch, stop);
         println!(
-            "'{NET_ID}' is already trained to superbatch {end_superbatch}. Nothing to do. \
-             (raise EPOCHS or set EREBUS_END_SUPERBATCH, then rerun to train longer.)"
+            "session {start_superbatch}..={stop}  (+{budget} sb = {PASS_FRACTION_PER_FILE} pass over \
+             {passed} positions in {} file(s); global end {global_end})",
+            files.len()
         );
-        return;
-    }
+        stop
+    };
 
     println!("--------------------------------------------------------------");
     println!("net id        : {NET_ID}   arch (768 -> {HIDDEN_SIZE}) x 2 -> 1 SCReLU");
     println!("quantisation  : QA={QA} QB={QB} eval_scale={EVAL_SCALE}");
-    println!("superbatches  : {start_superbatch}..={end_superbatch}  ({BATCHES_PER_SUPERBATCH} x {BATCH_SIZE})");
-    println!("lr            : {LR_START} -> {LR_FINAL} cosine");
-    println!("wdl lambda    : {WDL_START} -> {WDL_END} linear");
+    println!("plan          : {TOTAL_PASSES} pass(es) over corpus -> global end {global_end} superbatches");
+    println!("this session  : {start_superbatch}..={end_superbatch}  ({BATCHES_PER_SUPERBATCH} x {BATCH_SIZE})");
+    println!("lr            : {LR_START} -> {LR_FINAL} cosine over 1..={global_end}");
+    println!("wdl lambda    : {WDL_START} -> {WDL_END} linear over 1..={global_end}");
     println!("save rate     : every {SAVE_RATE} superbatches -> {OUT_DIR}/");
     println!("data          : {} files, {DATA_THREADS} decode threads, {SHUFFLE_BUFFER_MB} MiB buffer", files.len());
     println!("--------------------------------------------------------------");
@@ -368,15 +454,15 @@ fn main() {
             start_superbatch,
             end_superbatch,
         },
-        // both schedulers key off the ABSOLUTE superbatch index, so they stay on
-        // schedule across any number of resumes.
-        wdl_scheduler: wdl::LinearWDL { start: WDL_START, end: WDL_END },
+        // both schedulers run over the ABSOLUTE 1..=global_end window, so they
+        // progress smoothly no matter how the plan is split into sessions.
+        wdl_scheduler: GlobalLinearWDL { start: WDL_START, end: WDL_END, final_superbatch: global_end },
         lr_scheduler: lr::CosineDecayLR {
             initial_lr: LR_START,
             final_lr: LR_FINAL,
-            final_superbatch: end_superbatch,
+            final_superbatch: global_end,
         },
-        // never coarser than the run itself (bullet always saves the last too).
+        // never coarser than the session (bullet always saves the last too).
         save_rate: SAVE_RATE.min(end_superbatch).max(1),
     };
 
@@ -392,7 +478,17 @@ fn main() {
 
     trainer.run(&schedule, &settings, &data_loader);
 
-    println!(
-        "done. deploy:  cp {OUT_DIR}/{NET_ID}-{end_superbatch}/quantised.bin  <engine>/nets/net.nnue"
-    );
+    // session finished cleanly -> clear the resume marker
+    let _ = std::fs::remove_file(session_path());
+
+    if end_superbatch >= global_end {
+        println!(
+            "done -- {TOTAL_PASSES}-pass plan complete at superbatch {global_end}.\n\
+             deploy:  cp {OUT_DIR}/{NET_ID}-{global_end}/quantised.bin  <engine>/nets/net.nnue"
+        );
+    } else {
+        println!(
+            "session done at {end_superbatch}/{global_end}. run the next binpack to continue."
+        );
+    }
 }
